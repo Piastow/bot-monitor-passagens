@@ -1,3 +1,4 @@
+import os
 import discord
 from discord.ext import commands, tasks
 import asyncio
@@ -11,10 +12,10 @@ import random
 # ==========================================
 # COLE SEU TOKEN AQUI (igual ao teste_token.py)
 # ==========================================
-DISCORD_TOKEN = "MTQ1ODIzMzI2MTQ2MDQyNjc3NA.Gai1xW.0smBrlcLkZPJNvdu9jAGFZ2Y7mcCC-4GMSMaDI"
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "seu-token-aqui")
 
 # ID do canal (copie do Discord com botao direito → Copiar ID)
-CANAL_ALERTAS_ID = 1458235959710584874
+CANAL_ALERTAS_ID = int(os.getenv("CANAL_ALERTAS_ID", "0"))
 
 # ==========================================
 # ROTAS PARA MONITORAR
@@ -228,4 +229,5 @@ if __name__ == "__main__":
     print("🚀 Iniciando Bot Monitor de Passagens...")
     print(f"⏰ Intervalo de checagem: {INTERVALO_CHECAGEM} horas")
     print(f"📚 Periodo de aprendizado: {DIAS_APRENDIZADO} dias")
+
     bot.run(DISCORD_TOKEN)
