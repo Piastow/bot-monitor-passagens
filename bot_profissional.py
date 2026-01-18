@@ -7,21 +7,19 @@ import os
 from collections import defaultdict
 import statistics
 from datetime import datetime, timedelta
-import base64
 
 # ==========================================
 # CONFIGURACOES
 # ==========================================
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "seu-token-aqui")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CANAL_ALERTAS_ID = int(os.getenv("CANAL_ALERTAS_ID", "0"))
+AMADEUS_API_KEY = os.getenv("AMADEUS_API_KEY")
+AMADEUS_API_SECRET = os.getenv("AMADEUS_API_SECRET")
 
-# Amadeus API
-AMADEUS_API_KEY = os.getenv("AMADEUS_API_KEY", "y4fp5EpWG5Ck4qrhQPTOfRHQlR7xUcV7")
-AMADEUS_API_SECRET = os.getenv("AMADEUS_API_SECRET", "489sijSGJqrYWe9o")
 AMADEUS_TOKEN = None
 AMADEUS_TOKEN_EXPIRY = None
 
-# Rotas para monitorar
+# Rotas dinamicas (podem ser adicionadas/removidas)
 ROTAS = [
     {"origem": "GRU", "destino": "SSA", "nome": "Sao Paulo → Salvador"},
     {"origem": "GRU", "destino": "FOR", "nome": "Sao Paulo → Fortaleza"},
@@ -37,396 +35,499 @@ ROTAS = [
     {"origem": "GRU", "destino": "LHR", "nome": "Sao Paulo → Londres"},
 ]
 
-# Configuracoes de alerta
-DIAS_APRENDIZADO = 7
+# Configuracoes
+DIAS_APRENDIZADO = 0  # Ja passou dos 7 dias!
 PERCENTUAL_DESCONTO = 35
 PERCENTUAL_ANOMALIA = 50
-INTERVALO_CHECAGEM = 6
+INTERVALO_BASE = 6  # Intervalo base em horas
+MODO_TESTE = False
 
-# ==========================================
-# SETUP DO BOT
-# ==========================================
+# Sistema dinamico de intervalos
+MODO_ATUAL = "NORMAL"  # NORMAL, ATIVO, CACADOR, ULTRA
+
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 historico_precos = defaultdict(list)
+alertas_personalizados = defaultdict(list)
 DATA_FILE = "historico_precos.json"
+ALERTAS_FILE = "alertas_personalizados.json"
 
-def carregar_historico():
-    global historico_precos
+def carregar_dados():
+    global historico_precos, alertas_personalizados
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r') as f:
             data = json.load(f)
             historico_precos = defaultdict(list, {k: v for k, v in data.items()})
-        print(f"✅ Historico carregado: {len(historico_precos)} rotas")
+    if os.path.exists(ALERTAS_FILE):
+        with open(ALERTAS_FILE, 'r') as f:
+            data = json.load(f)
+            alertas_personalizados = defaultdict(list, {k: v for k, v in data.items()})
 
-def salvar_historico():
+def salvar_dados():
     with open(DATA_FILE, 'w') as f:
-        json.dump(dict(historico_precos), f, indent=2)
+        json.dump(dict(historico_precos), f)
+    with open(ALERTAS_FILE, 'w') as f:
+        json.dump(dict(alertas_personalizados), f)
 
 # ==========================================
-# AMADEUS API - AUTENTICACAO
+# AMADEUS API
 # ==========================================
 async def obter_token_amadeus():
     global AMADEUS_TOKEN, AMADEUS_TOKEN_EXPIRY
-    
-    # Verifica se token ainda e valido
     if AMADEUS_TOKEN and AMADEUS_TOKEN_EXPIRY and datetime.now() < AMADEUS_TOKEN_EXPIRY:
         return AMADEUS_TOKEN
     
     url = "https://test.api.amadeus.com/v1/security/oauth2/token"
-    
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": AMADEUS_API_KEY,
-        "client_secret": AMADEUS_API_SECRET
-    }
-    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, data=data) as response:
+            async with session.post(url, 
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={"grant_type": "client_credentials", "client_id": AMADEUS_API_KEY, "client_secret": AMADEUS_API_SECRET}
+            ) as response:
                 if response.status == 200:
                     result = await response.json()
                     AMADEUS_TOKEN = result['access_token']
-                    expires_in = result['expires_in']
-                    AMADEUS_TOKEN_EXPIRY = datetime.now() + timedelta(seconds=expires_in - 60)
-                    print("✅ Token Amadeus obtido com sucesso")
+                    AMADEUS_TOKEN_EXPIRY = datetime.now() + timedelta(seconds=result['expires_in'] - 60)
                     return AMADEUS_TOKEN
-                else:
-                    print(f"❌ Erro ao obter token: {response.status}")
-                    return None
     except Exception as e:
-        print(f"❌ Erro na autenticacao Amadeus: {e}")
-        return None
+        print(f"❌ Erro auth: {e}")
+    return None
 
-# ==========================================
-# AMADEUS API - BUSCAR PRECOS
-# ==========================================
-async def buscar_preco_amadeus(origem, destino):
+async def buscar_preco(origem, destino):
     token = await obter_token_amadeus()
     if not token:
         return None
     
-    # Data de partida (30 dias a frente)
     data_partida = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-    
     url = "https://test.api.amadeus.com/v2/shopping/flight-offers"
-    
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
-    
-    params = {
-        "originLocationCode": origem,
-        "destinationLocationCode": destino,
-        "departureDate": data_partida,
-        "adults": 1,
-        "currencyCode": "BRL",
-        "max": 1
-    }
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params) as response:
+            async with session.get(url,
+                headers={"Authorization": f"Bearer {token}"},
+                params={"originLocationCode": origem, "destinationLocationCode": destino,
+                       "departureDate": data_partida, "adults": 1, "currencyCode": "BRL", "max": 1}
+            ) as response:
                 if response.status == 200:
                     result = await response.json()
                     if result.get('data') and len(result['data']) > 0:
-                        preco = float(result['data'][0]['price']['total'])
-                        print(f"✅ Preco real obtido: {origem}→{destino} = R$ {preco:.2f}")
-                        return preco
-                    else:
-                        print(f"⚠️ Nenhum voo encontrado: {origem}→{destino}")
-                        return None
-                else:
-                    print(f"❌ Erro na API: {response.status}")
-                    return None
+                        return float(result['data'][0]['price']['total'])
     except Exception as e:
-        print(f"❌ Erro ao buscar preco: {e}")
-        return None
+        print(f"❌ Erro busca: {e}")
+    return None
 
 # ==========================================
-# CALCULO DE ESTATISTICAS E SCORE
+# ESTATISTICAS E SCORE
 # ==========================================
 def calcular_estatisticas(rota_id):
     precos = [p['preco'] for p in historico_precos[rota_id]]
     if len(precos) < 2:
         return None, None, None, None
-    
-    media = statistics.mean(precos)
-    desvio = statistics.stdev(precos) if len(precos) > 1 else 0
-    minimo = min(precos)
-    maximo = max(precos)
-    
-    return media, desvio, minimo, maximo
+    return statistics.mean(precos), statistics.stdev(precos), min(precos), max(precos)
 
 def calcular_score(preco_atual, media, minimo, maximo):
-    """
-    Calcula score de 0-10 baseado em quao bom e o preco
-    10 = preco minimo historico
-    0 = preco maximo historico
-    """
     if not media or maximo == minimo:
         return 5
-    
-    # Normaliza o preco entre 0 e 10
     score = 10 - ((preco_atual - minimo) / (maximo - minimo) * 10)
     return max(0, min(10, score))
 
-def determinar_urgencia(score, percentual_diferenca):
-    """Determina urgencia de compra"""
+def calcular_tendencia(rota_id):
+    hist = historico_precos[rota_id]
+    if len(hist) < 5:
+        return "ESTAVEL", 0
+    
+    ultimos_5 = [p['preco'] for p in hist[-5:]]
+    primeiros = statistics.mean(ultimos_5[:3])
+    recentes = statistics.mean(ultimos_5[2:])
+    
+    variacao = ((recentes - primeiros) / primeiros) * 100
+    
+    if variacao < -5:
+        return "CAINDO", variacao
+    elif variacao > 5:
+        return "SUBINDO", variacao
+    return "ESTAVEL", variacao
+
+def determinar_urgencia(score, tendencia):
     if score >= 9:
-        return "COMPRE AGORA! Preco historico minimo!"
+        return "🔥 COMPRE AGORA! Preco minimo historico!"
     elif score >= 8:
-        return "COMPRE HOJE! Preco excelente!"
+        if tendencia == "SUBINDO":
+            return "⚡ COMPRE HOJE! Preco excelente e subindo!"
+        return "⚡ COMPRE HOJE! Preco excelente!"
     elif score >= 7:
-        return "Boa oportunidade. Considere comprar."
+        return "✅ Boa oportunidade. Vale comprar."
     elif score >= 6:
-        return "Preco OK. Pode aguardar um pouco."
+        if tendencia == "CAINDO":
+            return "⏰ Preco OK mas CAINDO. Aguarde mais um pouco."
+        return "⏰ Preco OK. Pode esperar."
     elif score >= 5:
-        return "Preco na media. Aguarde."
-    else:
-        return "Preco alto. NAO compre agora."
+        return "📊 Preco na media. Aguarde melhores."
+    return "❌ Preco ALTO. NAO compre agora!"
 
 def determinar_tipo_alerta(preco_atual, media, score):
-    if not media or media == 0:
+    if not media:
         return None
+    percentual = ((media - preco_atual) / media) * 100
     
-    percentual_diferenca = ((media - preco_atual) / media) * 100
-    
-    if percentual_diferenca >= PERCENTUAL_ANOMALIA or score >= 9:
-        return "erro_preco"  # Possivel erro = OPORTUNIDADE MAXIMA
-    elif percentual_diferenca >= PERCENTUAL_DESCONTO or score >= 8:
-        return "promocao_excelente"
-    elif percentual_diferenca >= 20 or score >= 7:
-        return "promocao_boa"
-    else:
-        return None
+    if percentual >= PERCENTUAL_ANOMALIA or score >= 9:
+        return "critico"
+    elif percentual >= PERCENTUAL_DESCONTO or score >= 8:
+        return "excelente"
+    elif percentual >= 20 or score >= 7:
+        return "bom"
+    return None
 
 # ==========================================
-# ALERTAS MELHORADOS
+# SISTEMA DINAMICO DE INTERVALOS
 # ==========================================
-async def enviar_alerta(canal, rota, preco_atual, media, minimo, maximo, score, tipo):
-    percentual = ((media - preco_atual) / media) * 100
-    urgencia = determinar_urgencia(score, percentual)
+def determinar_intervalo():
+    global MODO_ATUAL
     
-    if tipo == "erro_preco":
-        cor = discord.Color.red()
-        emoji = "🚨"
-        titulo = "ERRO DE PRECO DETECTADO!"
-        descricao = "COMPRE IMEDIATAMENTE! Preco anormal!"
-    elif tipo == "promocao_excelente":
-        cor = discord.Color.gold()
-        emoji = "⚡"
-        titulo = "PROMOCAO EXCELENTE!"
-        descricao = "Preco muito bom! Recomendado comprar!"
-    else:
-        cor = discord.Color.green()
-        emoji = "🎉"
-        titulo = "BOA PROMOCAO ENCONTRADA"
-        descricao = "Preco abaixo da media"
+    # Analisa todas as rotas pra ver se tem algo interessante
+    quedas_grandes = 0
     
-    embed = discord.Embed(title=f"{emoji} {titulo}", color=cor, timestamp=datetime.now())
+    for rota in ROTAS:
+        rota_id = f"{rota['origem']}-{rota['destino']}"
+        hist = historico_precos[rota_id]
+        
+        if len(hist) < 3:
+            continue
+        
+        media, _, _, _ = calcular_estatisticas(rota_id)
+        if not media:
+            continue
+        
+        ultimo_preco = hist[-1]['preco']
+        percentual = ((media - ultimo_preco) / media) * 100
+        
+        if percentual >= 40:
+            MODO_ATUAL = "ULTRA"
+            return 0.25  # 15 minutos
+        elif percentual >= 25:
+            quedas_grandes += 1
+    
+    if quedas_grandes >= 2:
+        MODO_ATUAL = "CACADOR"
+        return 0.5  # 30 minutos
+    elif quedas_grandes >= 1:
+        MODO_ATUAL = "ATIVO"
+        return 2  # 2 horas
+    
+    MODO_ATUAL = "NORMAL"
+    return INTERVALO_BASE
+
+# ==========================================
+# ALERTAS
+# ==========================================
+async def enviar_alerta(canal, rota, preco, media, minimo, maximo, score, tipo, tendencia, var_tendencia):
+    percentual = ((media - preco) / media) * 100
+    urgencia = determinar_urgencia(score, tendencia)
+    
+    config = {
+        "critico": {
+            "cor": discord.Color.red(),
+            "emoji": "🚨",
+            "titulo": "ERRO DE PRECO DETECTADO!",
+            "desc": "POSSIVEL BUG! Compre IMEDIATAMENTE!"
+        },
+        "excelente": {
+            "cor": discord.Color.gold(),
+            "emoji": "⚡",
+            "titulo": "PROMOCAO EXCELENTE!",
+            "desc": "Preco muito bom! Recomendado comprar HOJE!"
+        },
+        "bom": {
+            "cor": discord.Color.green(),
+            "emoji": "🎉",
+            "titulo": "BOA PROMOCAO!",
+            "desc": "Preco abaixo da media. Vale considerar."
+        }
+    }
+    
+    cfg = config[tipo]
+    embed = discord.Embed(title=f"{cfg['emoji']} {cfg['titulo']}", color=cfg['cor'], timestamp=datetime.now())
+    embed.description = cfg['desc']
+    
     embed.add_field(name="✈️ Rota", value=rota['nome'], inline=False)
-    embed.add_field(name="💰 Preco Atual", value=f"**R$ {preco_atual:,.2f}**", inline=True)
-    embed.add_field(name="📊 Media Historica", value=f"R$ {media:,.2f}", inline=True)
+    embed.add_field(name="💰 Preco Atual", value=f"**R$ {preco:,.2f}**", inline=True)
+    embed.add_field(name="📊 Media Hist.", value=f"R$ {media:,.2f}", inline=True)
     embed.add_field(name="📉 Desconto", value=f"**{percentual:.1f}%**", inline=True)
     embed.add_field(name="🏆 Score", value=f"**{score:.1f}/10**", inline=True)
-    embed.add_field(name="💎 Menor Preco", value=f"R$ {minimo:,.2f}", inline=True)
-    embed.add_field(name="📈 Maior Preco", value=f"R$ {maximo:,.2f}", inline=True)
+    embed.add_field(name="💎 Min. Hist.", value=f"R$ {minimo:,.2f}", inline=True)
+    embed.add_field(name="📈 Max. Hist.", value=f"R$ {maximo:,.2f}", inline=True)
+    
+    # Tendencia
+    emoji_tend = "📉" if tendencia == "CAINDO" else "📈" if tendencia == "SUBINDO" else "➡️"
+    embed.add_field(name=f"{emoji_tend} Tendencia", value=f"{tendencia} ({var_tendencia:+.1f}%)", inline=True)
+    
     embed.add_field(name="⏰ Urgencia", value=urgencia, inline=False)
-    embed.add_field(name="🔗 Como comprar", value=f"[Google Flights](https://www.google.com/flights?q=flights+from+{rota['origem']}+to+{rota['destino']})", inline=False)
-    embed.set_footer(text=f"Bot Monitor Profissional • {rota['origem']}→{rota['destino']}")
+    embed.add_field(name="🔗 Comprar", value=f"[Google Flights](https://www.google.com/flights?q=flights+from+{rota['origem']}+to+{rota['destino']})", inline=False)
+    
+    embed.set_footer(text=f"Monitor Profissional • Modo: {MODO_ATUAL} • {rota['origem']}→{rota['destino']}")
+    
+    await canal.send(embed=embed)
+    
+    # Checa alertas personalizados
+    await checar_alertas_personalizados(canal, rota, preco)
+
+async def checar_alertas_personalizados(canal, rota, preco):
+    rota_id = f"{rota['origem']}-{rota['destino']}"
+    
+    for user_id, alertas in alertas_personalizados.items():
+        for alerta in alertas:
+            if alerta['rota'] == rota_id and preco <= alerta['preco_max']:
+                try:
+                    user = await bot.fetch_user(int(user_id))
+                    embed = discord.Embed(
+                        title="🔔 SEU ALERTA PERSONALIZADO!",
+                        description=f"O preco de {rota['nome']} atingiu seu alerta!",
+                        color=discord.Color.blue()
+                    )
+                    embed.add_field(name="Preco Atual", value=f"R$ {preco:,.2f}")
+                    embed.add_field(name="Seu Alerta", value=f"R$ {alerta['preco_max']:,.2f}")
+                    await user.send(embed=embed)
+                except:
+                    pass
+
+# ==========================================
+# RELATORIO DIARIO
+# ==========================================
+@tasks.loop(hours=24)
+async def relatorio_diario():
+    now = datetime.now()
+    if now.hour != 20:  # Espera ate 20h
+        return
+    
+    canal = bot.get_channel(CANAL_ALERTAS_ID)
+    if not canal:
+        return
+    
+    # Coleta dados
+    promocoes = []
+    tendencias_alta = []
+    tendencias_baixa = []
+    
+    for rota in ROTAS:
+        rota_id = f"{rota['origem']}-{rota['destino']}"
+        hist = historico_precos[rota_id]
+        
+        if not hist or len(hist) < 5:
+            continue
+        
+        media, _, minimo, maximo = calcular_estatisticas(rota_id)
+        if not media:
+            continue
+        
+        ultimo = hist[-1]['preco']
+        score = calcular_score(ultimo, media, minimo, maximo)
+        percentual = ((media - ultimo) / media) * 100
+        tendencia, var = calcular_tendencia(rota_id)
+        
+        if percentual > 15:
+            promocoes.append({
+                'rota': rota,
+                'preco': ultimo,
+                'percentual': percentual,
+                'score': score
+            })
+        
+        if tendencia == "SUBINDO" and var > 5:
+            tendencias_alta.append({'rota': rota, 'var': var})
+        elif tendencia == "CAINDO" and var < -5:
+            tendencias_baixa.append({'rota': rota, 'var': var})
+    
+    # Monta relatorio
+    embed = discord.Embed(
+        title="📊 RELATÓRIO DIÁRIO",
+        description=f"🗓️ {now.strftime('%d de %B de %Y')}",
+        color=discord.Color.blue(),
+        timestamp=now
+    )
+    
+    # Top 5 promocoes
+    if promocoes:
+        promocoes.sort(key=lambda x: x['score'], reverse=True)
+        top5 = promocoes[:5]
+        
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        promo_text = ""
+        for i, p in enumerate(top5):
+            promo_text += f"{medals[i]} **{p['rota']['nome']}**\n"
+            promo_text += f"   R$ {p['preco']:,.2f} ({p['percentual']:.1f}% OFF) | Score: {p['score']:.1f}/10\n"
+        
+        embed.add_field(name="🔥 TOP 5 PROMOCOES", value=promo_text, inline=False)
+    
+    # Tendencias
+    if tendencias_baixa or tendencias_alta:
+        tend_text = ""
+        if tendencias_baixa:
+            tend_text += "📉 **CAINDO** (aguarde!):\n"
+            for t in tendencias_baixa[:3]:
+                tend_text += f"   • {t['rota']['nome']} ({t['var']:.1f}%)\n"
+        if tendencias_alta:
+            tend_text += "\n📈 **SUBINDO** (nao compre!):\n"
+            for t in tendencias_alta[:3]:
+                tend_text += f"   • {t['rota']['nome']} (+{t['var']:.1f}%)\n"
+        
+        embed.add_field(name="📈 TENDENCIAS", value=tend_text, inline=False)
+    
+    # Estatisticas
+    total_checagens = sum(len(historico_precos[f"{r['origem']}-{r['destino']}"]) for r in ROTAS)
+    embed.add_field(name="📊 Estatisticas", value=f"Checagens hoje: ~{total_checagens//len(ROTAS)}\nRotas: {len(ROTAS)}\nModo: {MODO_ATUAL}", inline=False)
+    
+    # Dica
+    embed.add_field(name="💡 DICA DO DIA", value="Terças e quartas costumam ser 10-15% mais baratas!\nPróxima terça: configure seus alertas!", inline=False)
+    
+    embed.set_footer(text="Próximo relatório: amanhã às 20h")
     
     await canal.send(embed=embed)
 
 # ==========================================
-# EVENTOS DO BOT
+# EVENTOS
 # ==========================================
 @bot.event
 async def on_ready():
-    print(f'✅ Bot conectado como {bot.user}')
-    print(f'📊 Monitorando {len(ROTAS)} rotas')
-    print(f'🔑 Amadeus API configurada')
-    carregar_historico()
+    print(f'✅ Bot conectado: {bot.user}')
+    print(f'📊 Rotas: {len(ROTAS)}')
+    print(f'🔥 Sistema dinamico ativo')
+    print(f'📚 Fase de aprendizado: CONCLUIDA')
+    carregar_dados()
     monitorar_precos.start()
+    relatorio_diario.start()
 
-@tasks.loop(hours=INTERVALO_CHECAGEM)
+@tasks.loop(hours=INTERVALO_BASE)
 async def monitorar_precos():
-    print(f"\n🔍 Iniciando verificacao de precos - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    # Determina intervalo dinamico
+    novo_intervalo = determinar_intervalo()
+    if novo_intervalo != monitorar_precos.hours:
+        monitorar_precos.change_interval(hours=novo_intervalo)
+        print(f"⚡ Modo alterado: {MODO_ATUAL} (intervalo: {novo_intervalo}h)")
+    
+    print(f"\n🔍 Checagem [{MODO_ATUAL}] - {datetime.now().strftime('%d/%m %H:%M')}")
     
     canal = bot.get_channel(CANAL_ALERTAS_ID)
     if not canal:
-        print("❌ Canal de alertas nao encontrado!")
         return
     
     for rota in ROTAS:
         rota_id = f"{rota['origem']}-{rota['destino']}"
+        preco = await buscar_preco(rota['origem'], rota['destino'])
         
-        # Busca preco REAL da Amadeus
-        preco = await buscar_preco_amadeus(rota['origem'], rota['destino'])
-        
-        if preco is None:
-            print(f"⚠️ Pulando {rota['nome']} (sem dados)")
+        if not preco:
             continue
         
-        # Registra no historico
-        historico_precos[rota_id].append({
-            'preco': preco,
-            'data': datetime.now().isoformat()
-        })
+        historico_precos[rota_id].append({'preco': preco, 'data': datetime.now().isoformat()})
         
-        # Calcula estatisticas
-        media, desvio, minimo, maximo = calcular_estatisticas(rota_id)
-        
-        # Verifica periodo de aprendizado
-        dias_de_dados = len(historico_precos[rota_id]) / (24 / INTERVALO_CHECAGEM)
-        
-        if dias_de_dados < DIAS_APRENDIZADO:
-            print(f"📚 {rota['nome']}: R$ {preco:.2f} (aprendendo... {dias_de_dados:.1f}/{DIAS_APRENDIZADO} dias)")
+        media, _, minimo, maximo = calcular_estatisticas(rota_id)
+        if not media:
+            print(f"📚 {rota['nome']}: R$ {preco:.2f} (coletando dados...)")
             continue
         
-        # Calcula score e verifica alertas
         score = calcular_score(preco, media, minimo, maximo)
-        tipo_alerta = determinar_tipo_alerta(preco, media, score)
+        tendencia, var_tend = calcular_tendencia(rota_id)
+        tipo = determinar_tipo_alerta(preco, media, score)
         
-        if tipo_alerta:
+        if tipo or MODO_TESTE:
             print(f"🔔 ALERTA! {rota['nome']}: R$ {preco:.2f} (score: {score:.1f}/10)")
-            await enviar_alerta(canal, rota, preco, media, minimo, maximo, score, tipo_alerta)
+            await enviar_alerta(canal, rota, preco, media, minimo, maximo, score, tipo or "bom", tendencia, var_tend)
         else:
-            print(f"✓ {rota['nome']}: R$ {preco:.2f} (score: {score:.1f}/10)")
+            print(f"✓ {rota['nome']}: R$ {preco:.2f} | Score: {score:.1f}/10 | {tendencia}")
         
-        await asyncio.sleep(3)  # Evita rate limit
+        await asyncio.sleep(2)
     
-    salvar_historico()
-    print(f"💾 Historico salvo\n")
+    salvar_dados()
 
 # ==========================================
 # COMANDOS
 # ==========================================
-@bot.command(name='status')
-async def status_comando(ctx):
-    embed = discord.Embed(title="📊 Status do Monitor Profissional", color=discord.Color.blue())
+@bot.command(name='adicionar')
+async def adicionar_rota(ctx, origem: str, destino: str, *, nome: str = None):
+    origem, destino = origem.upper(), destino.upper()
     
-    total_rotas = len(ROTAS)
-    rotas_com_dados = len([r for r in ROTAS if f"{r['origem']}-{r['destino']}" in historico_precos])
-    
-    embed.add_field(name="✈️ Rotas Monitoradas", value=str(total_rotas), inline=True)
-    embed.add_field(name="📊 Rotas com Dados", value=str(rotas_com_dados), inline=True)
-    embed.add_field(name="⏰ Intervalo", value=f"{INTERVALO_CHECAGEM}h", inline=True)
-    
-    # Mostra ultimas 5 rotas
-    for rota in ROTAS[:5]:
-        rota_id = f"{rota['origem']}-{rota['destino']}"
-        historico = historico_precos[rota_id]
-        
-        if historico:
-            ultimo_preco = historico[-1]['preco']
-            media, _, minimo, _ = calcular_estatisticas(rota_id)
-            score = calcular_score(ultimo_preco, media, minimo, historico[-1]['preco']) if media else 5
-            
-            status = f"💰 R$ {ultimo_preco:.2f}\n🏆 Score: {score:.1f}/10"
-            if media:
-                status += f"\n📊 Media: R$ {media:.2f}"
-            
-            embed.add_field(name=f"✈️ {rota['nome']}", value=status, inline=False)
-    
-    embed.set_footer(text="Use !listar para ver todas as rotas")
-    await ctx.send(embed=embed)
-
-@bot.command(name='listar')
-async def listar_comando(ctx):
-    embed = discord.Embed(title="✈️ Todas as Rotas Monitoradas", color=discord.Color.blue())
-    
-    for rota in ROTAS:
-        rota_id = f"{rota['origem']}-{rota['destino']}"
-        historico = historico_precos[rota_id]
-        
-        if historico:
-            ultimo_preco = historico[-1]['preco']
-            media, _, minimo, maximo = calcular_estatisticas(rota_id)
-            score = calcular_score(ultimo_preco, media, minimo, maximo) if media else 5
-            
-            status = f"💰 **R$ {ultimo_preco:.2f}** | 🏆 {score:.1f}/10"
-            embed.add_field(name=rota['nome'], value=status, inline=False)
-        else:
-            embed.add_field(name=rota['nome'], value="⏳ Aguardando dados...", inline=False)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='melhor')
-async def melhor_comando(ctx, destino: str):
-    destino = destino.upper()
-    rotas_destino = [r for r in ROTAS if r['destino'] == destino]
-    
-    if not rotas_destino:
-        await ctx.send(f"❌ Destino {destino} nao encontrado!")
+    if any(r['origem'] == origem and r['destino'] == destino for r in ROTAS):
+        await ctx.send(f"❌ Rota {origem}→{destino} ja existe!")
         return
     
-    embed = discord.Embed(title=f"💎 Melhor Preco para {destino}", color=discord.Color.gold())
+    if not nome:
+        nome = f"{origem} → {destino}"
     
-    for rota in rotas_destino:
-        rota_id = f"{rota['origem']}-{rota['destino']}"
-        historico = historico_precos[rota_id]
-        
-        if historico:
-            precos = [p['preco'] for p in historico]
-            minimo = min(precos)
-            atual = historico[-1]['preco']
-            media = statistics.mean(precos)
-            
-            info = f"💎 Menor: **R$ {minimo:.2f}**\n💰 Atual: R$ {atual:.2f}\n📊 Media: R$ {media:.2f}"
-            embed.add_field(name=rota['nome'], value=info, inline=False)
+    ROTAS.append({"origem": origem, "destino": destino, "nome": nome})
+    await ctx.send(f"✅ Rota adicionada: {nome}")
+
+@bot.command(name='remover')
+async def remover_rota(ctx, origem: str, destino: str):
+    origem, destino = origem.upper(), destino.upper()
+    
+    for i, r in enumerate(ROTAS):
+        if r['origem'] == origem and r['destino'] == destino:
+            ROTAS.pop(i)
+            await ctx.send(f"✅ Rota removida: {r['nome']}")
+            return
+    
+    await ctx.send(f"❌ Rota {origem}→{destino} nao encontrada!")
+
+@bot.command(name='alerta')
+async def criar_alerta(ctx, origem: str, destino: str, preco_max: float):
+    origem, destino = origem.upper(), destino.upper()
+    rota_id = f"{origem}-{destino}"
+    user_id = str(ctx.author.id)
+    
+    if user_id not in alertas_personalizados:
+        alertas_personalizados[user_id] = []
+    
+    alertas_personalizados[user_id].append({
+        'rota': rota_id,
+        'preco_max': preco_max
+    })
+    
+    salvar_dados()
+    await ctx.send(f"✅ Alerta criado! Voce sera notificado quando {origem}→{destino} ficar abaixo de R$ {preco_max:,.2f}")
+
+@bot.command(name='deal')
+async def deal_comando(ctx, origem: str, destino: str):
+    origem, destino = origem.upper(), destino.upper()
+    rota_id = f"{origem}-{destino}"
+    
+    hist = historico_precos[rota_id]
+    if not hist or len(hist) < 5:
+        await ctx.send("❌ Dados insuficientes para analise!")
+        return
+    
+    media, _, minimo, maximo = calcular_estatisticas(rota_id)
+    ultimo = hist[-1]['preco']
+    score = calcular_score(ultimo, media, minimo, maximo)
+    tendencia, var = calcular_tendencia(rota_id)
+    urgencia = determinar_urgencia(score, tendencia)
+    
+    embed = discord.Embed(title=f"💎 ANALISE: {origem} → {destino}", color=discord.Color.purple())
+    embed.add_field(name="💰 Preco Atual", value=f"R$ {ultimo:,.2f}", inline=True)
+    embed.add_field(name="📊 Media", value=f"R$ {media:,.2f}", inline=True)
+    embed.add_field(name="🏆 Score", value=f"**{score:.1f}/10**", inline=True)
+    embed.add_field(name="💎 Min. Historico", value=f"R$ {minimo:,.2f}", inline=True)
+    embed.add_field(name="📈 Max. Historico", value=f"R$ {maximo:,.2f}", inline=True)
+    
+    emoji_tend = "📉" if tendencia == "CAINDO" else "📈" if tendencia == "SUBINDO" else "➡️"
+    embed.add_field(name=f"{emoji_tend} Tendencia", value=f"{tendencia} ({var:+.1f}%)", inline=True)
+    embed.add_field(name="⏰ Recomendacao", value=urgencia, inline=False)
     
     await ctx.send(embed=embed)
 
-@bot.command(name='top5')
-async def top5_comando(ctx):
-    promocoes = []
+@bot.command(name='teste')
+async def modo_teste(ctx, acao: str):
+    global MODO_TESTE, DIAS_APRENDIZADO
     
-    for rota in ROTAS:
-        rota_id = f"{rota['origem']}-{rota['destino']}"
-        historico = historico_precos[rota_id]
-        
-        if historico and len(historico) >= 5:
-            preco_atual = historico[-1]['preco']
-            media, _, minimo, maximo = calcular_estatisticas(rota_id)
-            if media:
-                score = calcular_score(preco_atual, media, minimo, maximo)
-                percentual = ((media - preco_atual) / media) * 100
-                
-                if percentual > 0:
-                    promocoes.append({
-                        'rota': rota,
-                        'preco': preco_atual,
-                        'percentual': percentual,
-                        'score': score
-                    })
-    
-    promocoes.sort(key=lambda x: x['score'], reverse=True)
-    top5 = promocoes[:5]
-    
-    if not top5:
-        await ctx.send("❌ Nenhuma promocao disponivel no momento!")
-        return
-    
-    embed = discord.Embed(title="🔥 TOP 5 MELHORES PROMOCOES", color=discord.Color.gold())
-    
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    
-    for i, p in enumerate(top5):
-        info = f"{medals[i]} **R$ {p['preco']:.2f}** | 📉 {p['percentual']:.1f}% OFF | 🏆 {p['score']:.1f}/10"
-        embed.add_field(name=p['rota']['nome'], value=info, inline=False)
-    
-    await ctx.send(embed=embed)
+    if acao.lower() == "on":
+        MODO_TESTE = True
+        DIAS_APRENDIZADO = 0
+        await ctx.send("✅ Modo teste ATIVADO! Alertas imediatos habilitados.")
+    elif acao.lower() == "off":
+        MODO_TESTE = False
+        await ctx.send("✅ Modo teste DESATIVADO. Voltando ao normal.")
 
 if __name__ == "__main__":
-    print("🚀 Iniciando Bot Monitor PROFISSIONAL...")
-    print(f"⏰ Intervalo de checagem: {INTERVALO_CHECAGEM} horas")
-    print(f"📚 Periodo de aprendizado: {DIAS_APRENDIZADO} dias")
-    print(f"🔑 Amadeus API ativa")
+    print("🚀 Bot Final Completo...")
     bot.run(DISCORD_TOKEN)
